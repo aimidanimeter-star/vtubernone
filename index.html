@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebAR VTuber</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        /* カメラ映像（背景） */
+        #input-video {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            object-fit: cover; z-index: 1; transform: scaleX(-1); /* 鏡像反転 */
+        }
+        /* 3Dキャンバス（手前） */
+        #output-canvas {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 2; pointer-events: none; /* 操作を透過 */
+        }
+        /* デバッグ等のロード表示 */
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-family: sans-serif; z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading...</div>
+    <video id="input-video" playsinline muted autoplay></video>
+    <canvas id="output-canvas"></canvas>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.146.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.146.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@0.6.11/lib/three-vrm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.5/dist/kalidokit.umd.js"></script>
+
+    <script>
+        // 設定
+        const VRM_PATH = './model.vrm'; // 同じフォルダに置いたVRMファイル名
+
+        // グローバル変数
+        let currentVrm = null;
+        const videoElement = document.getElementById('input-video');
+        const canvasElement = document.getElementById('output-canvas');
+        
+        // Three.js シーンセットアップ
+        const scene = new THREE.Scene();
+        
+        // カメラ設定 (3D空間用)
+        const camera = new THREE.PerspectiveCamera(30.0, window.innerWidth / window.innerHeight, 0.1, 20.0);
+        camera.position.set(0, 1.4, 1.5); // 顔の少し前あたりにカメラを置く
+
+        const renderer = new THREE.WebGLRenderer({ canvas: canvasElement, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+
+        // ライト
+        const light = new THREE.DirectionalLight(0xffffff);
+        light.position.set(1.0, 1.0, 1.0).normalize();
+        scene.add(light);
+
+        // VRM読み込み
+        const loader = new THREE.GLTFLoader();
+        loader.load(
+            VRM_PATH,
+            (gltf) => {
+                THREE.VRM.from(gltf).then((vrm) => {
+                    scene.add(vrm.scene);
+                    currentVrm = vrm;
+                    vrm.scene.rotation.y = Math.PI; // モデルを正面に向ける
+
+                    // 初期位置調整（カメラに映る位置へ）
+                    vrm.scene.position.y = -0.5; 
+                    
+                    console.log("VRM Loaded");
+                    document.getElementById('loading').style.display = 'none';
+                });
+            },
+            (progress) => console.log('Loading... ' + 100.0 * (progress.loaded / progress.total) + '%'),
+            (error) => console.error(error)
+        );
+
+        // アニメーションループ
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            if (currentVrm) {
+                currentVrm.update(delta);
+            }
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // ウィンドウサイズ変更対応
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            renderer.setSize(w, h);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+        });
+
+        // --- MediaPipe & Kalidokit 設定 ---
+
+        // MediaPipeの結果を受け取る関数
+        const onResults = (results) => {
+            if (!currentVrm || !results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
+
+            const landmarks = results.multiFaceLandmarks[0];
+
+            // Kalidokitで顔の動きを計算
+            const solver = Kalidokit.Face.solve(landmarks, {
+                runtime: "mediapipe",
+                video: videoElement
+            });
+
+            if (solver) {
+                // 1. 首・頭の回転を適用
+                const rigRotation = solver.head; // {x, y, z}
+                // VRMのボーン操作 (Mirrorしつつ適用)
+                // シンプルにHeadボーンだけ回す例
+                const headBone = currentVrm.humanoid.getBoneNode(THREE.VRMSchema.HumanoidBoneName.Head);
+                if(headBone) {
+                    // 鏡像反転の補正などを入れて回転
+                    headBone.rotation.set(
+                        -rigRotation.x, 
+                        -rigRotation.y, 
+                        -rigRotation.z
+                    );
+                }
+
+                // 2. 表情（ブレンドシェイプ）を適用
+                const rigFace = solver.mouth; // 口の形など
+                const preset = THREE.VRMSchema.BlendShapePresetName;
+                
+                // 口の開き具合 (A, I, U, E, Oのブレンドは複雑なので、単純にAで開閉させる例)
+                const openAmount = rigFace.shape.A || 0;
+                currentVrm.blendShapeProxy.setValue(preset.A, openAmount);
+                
+                // 瞬き
+                const blinkL = 1 - (solver.eye.l || 1); // Kalidokitの仕様により反転
+                const blinkR = 1 - (solver.eye.r || 1);
+                currentVrm.blendShapeProxy.setValue(preset.BlinkL, blinkL);
+                currentVrm.blendShapeProxy.setValue(preset.BlinkR, blinkR);
+            }
+        };
+
+        // MediaPipe FaceMeshの初期化
+        const faceMesh = new FaceMesh({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+        }});
+        
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        faceMesh.onResults(onResults);
+
+        // カメラ起動
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await faceMesh.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        cameraUtils.start();
+
+    </script>
+</body>
+</html>
