@@ -3,164 +3,204 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>WebAR Local File</title>
+    <title>WebAR Ultimate</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
         #video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); z-index: 1; }
         #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
         
-        /* ファイル選択UI */
+        /* UIレイヤー */
         #ui-layer {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             z-index: 999; display: flex; flex-direction: column;
             align-items: center; justify-content: center;
-            background: rgba(0,0,0,0.6);
+            background: rgba(0,0,0,0.8);
         }
-        .btn-container {
-            background: white; padding: 20px; border-radius: 12px; text-align: center;
+        .box {
+            background: white; padding: 30px; border-radius: 15px; 
+            text-align: center; width: 80%; max-width: 300px;
         }
-        h2 { margin: 0 0 10px 0; font-size: 18px; }
-        p { font-size: 12px; color: #666; }
-        input[type="file"] { margin-top: 10px; }
+        h2 { margin: 0 0 15px 0; font-size: 18px; color: #333; }
+        p { font-size: 13px; color: #666; margin-bottom: 20px; }
         
-        #loading-msg {
-            color: #0f0; font-weight: bold; margin-top: 20px; display: none;
-            text-shadow: 1px 1px 0 #000;
+        /* デバッグログ */
+        #debug-log {
+            position: absolute; bottom: 0; left: 0; width: 100%; height: 150px;
+            background: rgba(0,0,0,0.5); color: #0f0; font-size: 10px;
+            overflow-y: scroll; z-index: 1000; padding: 5px; pointer-events: none;
+            display: block; /* 常時表示 */
         }
+        .error { color: #ff3333; font-weight: bold; font-size: 12px; }
     </style>
-    <script type="importmap">
-    {
-        "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
-            "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.0.0/lib/three-vrm.module.js"
-        }
-    </script>
 </head>
 <body>
     <div id="ui-layer">
-        <div class="btn-container">
-            <h2>VRMファイルを選択してください</h2>
-            <p>iPhone内の .vrm ファイルを選べば<br>すぐに表示されます</p>
-            <input type="file" id="file-input" accept=".vrm">
-            <div id="loading-msg">モデル読込中...</div>
+        <div class="box">
+            <h2>VRMを読み込む</h2>
+            <p>iPhone内のファイルを選択してください<br>(2021年モデル対応版)</p>
+            <input type="file" id="file-input" accept="*">
+            <div id="loading-text" style="margin-top:15px; color:blue; display:none; font-weight:bold;">読み込み処理中...</div>
         </div>
     </div>
+
+    <div id="debug-log">システム待機中...</div>
 
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas"></canvas>
 
+    <script src="https://cdn.jsdelivr.net/npm/three@0.146.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.146.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@0.6.11/lib/three-vrm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.5/dist/kalidokit.umd.js"></script>
 
-    <script type="module">
-        import * as THREE from 'three';
-        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-        import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+    <script>
+        // ログ機能
+        const debugLog = document.getElementById('debug-log');
+        function log(msg, isError) {
+            const div = document.createElement('div');
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            if(isError) div.className = 'error';
+            debugLog.insertBefore(div, debugLog.firstChild);
+            console.log(msg);
+        }
 
-        // 要素取得
+        // エラーハンドリング
+        window.onerror = function(msg, url, line) {
+            log(`SYSTEM ERROR: ${msg} (Line:${line})`, true);
+        };
+
+        log("スクリプト初期化開始...");
+
         const uiLayer = document.getElementById('ui-layer');
         const fileInput = document.getElementById('file-input');
-        const loadingMsg = document.getElementById('loading-msg');
+        const loadingText = document.getElementById('loading-text');
 
-        // 3Dシーン設定
+        let currentVrm = null;
+        let faceMesh = null;
+
+        // 1. Three.js初期化
         const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('canvas'), alpha: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.setPixelRatio(window.devicePixelRatio);
-        renderer.outputColorSpace = THREE.SRGBColorSpace;
-
+        
         const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(35.0, window.innerWidth / window.innerHeight, 0.1, 20.0);
+        const camera = new THREE.PerspectiveCamera(30.0, window.innerWidth / window.innerHeight, 0.1, 20.0);
         camera.position.set(0, 1.4, 1.5);
-
-        const light = new THREE.DirectionalLight(0xffffff, 1.5);
-        light.position.set(0, 0, 1).normalize();
+        
+        const light = new THREE.DirectionalLight(0xffffff, 1.0);
+        light.position.set(1.0, 1.0, 1.0).normalize();
         scene.add(light);
-        scene.add(new THREE.AmbientLight(0xffffff, 0.8));
 
-        let currentVrm = null;
+        // 2. ファイル選択イベント
+        fileInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) {
+                log("ファイルが選択されませんでした", true);
+                return;
+            }
 
-        // ファイルが選択された時の処理
-        fileInput.addEventListener('change', (event) => {
-            const file = event.target.files[0];
-            if (!file) return;
-
-            loadingMsg.style.display = 'block';
+            log(`ファイル選択: ${file.name} (${Math.round(file.size/1024)}KB)`);
+            loadingText.style.display = 'block';
             
-            // ローカルファイルのURLを生成
             const blobUrl = URL.createObjectURL(file);
             loadVRM(blobUrl);
         });
 
+        // 3. VRM読み込み (0.6.11 - 2021モデルに最適)
         function loadVRM(url) {
-            const loader = new GLTFLoader();
-            loader.register((parser) => new VRMLoaderPlugin(parser));
-
+            log("VRMロード処理開始...");
+            const loader = new THREE.GLTFLoader();
+            
             loader.load(
                 url,
                 (gltf) => {
-                    const vrm = gltf.userData.vrm;
-                    VRMUtils.removeUnnecessaryVertices(gltf.scene);
-                    VRMUtils.combineSkeletons(gltf.scene);
-                    vrm.scene.rotation.y = Math.PI; 
-                    
-                    scene.add(vrm.scene);
-                    currentVrm = vrm;
-                    
-                    // UIを隠してカメラ開始
-                    uiLayer.style.display = 'none';
-                    startCamera();
+                    log("GLTFパース完了。VRM変換中...");
+                    THREE.VRM.from(gltf).then((vrm) => {
+                        scene.add(vrm.scene);
+                        currentVrm = vrm;
+                        vrm.scene.rotation.y = Math.PI; 
+                        
+                        // 調整
+                        vrm.scene.position.y = -0.5;
+
+                        log("VRM表示成功！UIを隠します");
+                        uiLayer.style.display = 'none';
+                        startCamera();
+                    }).catch(err => {
+                        log("VRM変換エラー: " + err, true);
+                    });
                 },
-                (progress) => console.log('Loading...'),
+                (progress) => {
+                    if(progress.total) {
+                        log(`ロード中: ${Math.round(progress.loaded / progress.total * 100)}%`);
+                    }
+                },
                 (error) => {
-                    console.error(error);
-                    alert("読み込みエラー！ファイルが壊れているか、正しいVRMではありません。");
-                    loadingMsg.style.display = 'none';
+                    log("読み込みエラー(Loader): " + error, true);
+                    loadingText.innerText = "読み込み失敗";
                 }
             );
         }
 
-        // アニメーションループ
+        // 4. アニメーションループ
         const clock = new THREE.Clock();
         function animate() {
             requestAnimationFrame(animate);
-            if (currentVrm) currentVrm.update(clock.getDelta());
+            const delta = clock.getDelta();
+            if (currentVrm) {
+                currentVrm.update(delta);
+            }
             renderer.render(scene, camera);
         }
         animate();
 
-        // 顔認識設定
-        const videoElement = document.getElementById('video');
+        // 5. 顔認識セットアップ
         function onResults(results) {
             if (!currentVrm || !results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
 
             const landmarks = results.multiFaceLandmarks[0];
-            const solver = Kalidokit.Face.solve(landmarks, { runtime: "mediapipe", video: videoElement });
+            const solver = Kalidokit.Face.solve(landmarks, { runtime: "mediapipe", video: document.getElementById('video') });
 
             if (solver) {
                 const rigRotation = solver.head;
-                const head = currentVrm.humanoid.getNormalizedBoneNode('head');
-                if(head) head.rotation.set(-rigRotation.x, -rigRotation.y, -rigRotation.z);
-
-                if (currentVrm.expressionManager) {
-                    currentVrm.expressionManager.setValue('aa', solver.mouth.shape.A || 0);
-                    currentVrm.expressionManager.setValue('blinkLeft', 1 - (solver.eye.l || 1));
-                    currentVrm.expressionManager.setValue('blinkRight', 1 - (solver.eye.r || 1));
+                const head = currentVrm.humanoid.getBoneNode(THREE.VRMSchema.HumanoidBoneName.Head);
+                if(head) {
+                    head.rotation.set(-rigRotation.x, -rigRotation.y, -rigRotation.z);
                 }
+
+                const preset = THREE.VRMSchema.BlendShapePresetName;
+                const rigFace = solver.mouth;
+                currentVrm.blendShapeProxy.setValue(preset.A, rigFace.shape.A || 0);
+                
+                const blinkL = 1 - (solver.eye.l || 1);
+                const blinkR = 1 - (solver.eye.r || 1);
+                currentVrm.blendShapeProxy.setValue(preset.BlinkL, blinkL);
+                currentVrm.blendShapeProxy.setValue(preset.BlinkR, blinkR);
             }
         }
 
-        async function startCamera() {
+        function startCamera() {
+            log("カメラ起動試行...");
+            const videoElement = document.getElementById('video');
             const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
-            faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+            
+            faceMesh.setOptions({
+                maxNumFaces: 1,
+                refineLandmarks: true,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
             faceMesh.onResults(onResults);
 
             const camera = new Camera(videoElement, {
                 onFrame: async () => { await faceMesh.send({image: videoElement}); },
                 width: 1280, height: 720
             });
-            await camera.start();
+            camera.start()
+                .then(() => log("カメラ起動完了"))
+                .catch(e => log("カメラエラー: " + e, true));
         }
         
         window.addEventListener('resize', () => {
